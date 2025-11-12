@@ -6,10 +6,19 @@
     <title>Dockerfile Build Visualizer</title>
     <!-- Load Tailwind CSS for styling -->
     <script src="https://cdn.tailwindcss.com"></script>
-    <!-- Load Prism.js for syntax highlighting -->
-    <link href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet" />
-    <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-docker.min.js"></script>
+    <!-- Load Shiki for syntax highlighting -->
+    <script type="module">
+        import { getHighlighter } from 'https://cdn.jsdelivr.net/npm/shiki@1.22.0/+esm';
+
+        // Initialize Shiki highlighter (will be available globally)
+        window.shikiHighlighter = null;
+        window.shikiReady = (async () => {
+            window.shikiHighlighter = await getHighlighter({
+                themes: ['one-dark-pro'],
+                langs: ['dockerfile']
+            });
+        })();
+    </script>
     <!-- Load Mermaid.js for graph rendering -->
     <script type="module">
         import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
@@ -514,12 +523,6 @@ ENTRYPOINT ["java", \\
             if (notification) {
                 notification.classList.add('hidden');
             }
-
-            // Reset dropdown to default state
-            const selector = document.getElementById('example-selector');
-            if (selector) {
-                selector.value = '';
-            }
         };
 
         function loadFromLocalStorage() {
@@ -533,6 +536,15 @@ ENTRYPOINT ["java", \\
 
                 if (savedView) {
                     currentView = savedView;
+                }
+
+                // Restore dropdown selection if saved
+                const savedExample = localStorage.getItem(STORAGE_KEYS.selectedExample);
+                if (savedExample) {
+                    const selector = document.getElementById('example-selector');
+                    if (selector) {
+                        selector.value = savedExample;
+                    }
                 }
 
                 // Show restore notification
@@ -1284,21 +1296,72 @@ ENTRYPOINT ["java", \\
         }
 
         // Sync syntax highlighting overlay with textarea content
-        function syncSyntaxHighlighting() {
+        async function syncSyntaxHighlighting() {
             const editor = document.getElementById('dockerfile-editor');
             const codeElement = document.getElementById('dockerfile-code');
 
-            if (editor && codeElement && typeof Prism !== 'undefined') {
-                // Update code content
-                codeElement.textContent = editor.value;
+            if (editor && codeElement && window.shikiHighlighter) {
+                try {
+                    // Get tokens from Shiki (more control over rendering)
+                    const tokens = window.shikiHighlighter.codeToTokensBase(editor.value, {
+                        lang: 'dockerfile',
+                        theme: 'one-dark-pro'
+                    });
 
-                // Apply Prism syntax highlighting
-                Prism.highlightElement(codeElement);
+                    // Manually render tokens to HTML with exact control
+                    let html = '';
+                    for (let i = 0; i < tokens.length; i++) {
+                        const line = tokens[i];
+                        for (const token of line) {
+                            const style = token.color ? `color: ${token.color}` : '';
+                            const fontStyle = token.fontStyle ? getFontStyleCSS(token.fontStyle) : '';
+                            const combinedStyle = [style, fontStyle].filter(Boolean).join('; ');
+
+                            if (combinedStyle) {
+                                html += `<span style="${combinedStyle}">${escapeHtml(token.content)}</span>`;
+                            } else {
+                                html += escapeHtml(token.content);
+                            }
+                        }
+                        // Add newline after each line except possibly the last
+                        if (i < tokens.length - 1) {
+                            html += '\n';
+                        }
+                    }
+
+                    // Preserve trailing newline if original text has one
+                    if (editor.value.endsWith('\n')) {
+                        html += '\n';
+                    }
+
+                    // Update the code element with highlighted content
+                    codeElement.innerHTML = html;
+                } catch (error) {
+                    console.error('Shiki highlighting error:', error);
+                    // Fallback to plain text if highlighting fails
+                    codeElement.textContent = editor.value;
+                }
             }
         }
 
+        // Helper function to convert font style flags to CSS
+        function getFontStyleCSS(fontStyle) {
+            const styles = [];
+            if (fontStyle & 1) styles.push('font-style: italic');
+            if (fontStyle & 2) styles.push('font-weight: bold');
+            if (fontStyle & 4) styles.push('text-decoration: underline');
+            return styles.join('; ');
+        }
+
+        // Helper function to escape HTML
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
         // Run on load and on editor input
-        window.onload = () => {
+        window.onload = async () => {
             const editor = document.getElementById('dockerfile-editor');
 
             // Try to restore from localStorage
@@ -1308,13 +1371,19 @@ ENTRYPOINT ["java", \\
             if (!restored) {
                 const defaultExample = EXAMPLES['multi-stage-node-nginx'];
                 editor.value = defaultExample.content;
+
+                // Set dropdown to match default example
+                const selector = document.getElementById('example-selector');
+                if (selector) {
+                    selector.value = 'multi-stage-node-nginx';
+                }
             }
 
             // Add event listeners
             editor.addEventListener('input', () => {
                 updateVisualization();
                 debouncedSave(); // Auto-save after user stops typing
-                syncSyntaxHighlighting(); // Update syntax highlighting
+                syncSyntaxHighlighting(); // Update syntax highlighting (async, fire-and-forget)
             });
 
             // Sync scroll between textarea and syntax highlight overlay
@@ -1328,7 +1397,10 @@ ENTRYPOINT ["java", \\
 
             // Initial render
             updateVisualization();
-            syncSyntaxHighlighting(); // Initial syntax highlighting
+
+            // Wait for Shiki to be ready before initial syntax highlighting
+            await window.shikiReady;
+            await syncSyntaxHighlighting(); // Initial syntax highlighting
 
             // Restore previous view if applicable
             if (restored && currentView) {
@@ -1337,58 +1409,65 @@ ENTRYPOINT ["java", \\
         };
     </script>
     <style>
-        /* Syntax highlighting overlay styles */
+        /* Syntax highlighting overlay styles - must match textarea exactly */
         #dockerfile-highlight {
             white-space: pre-wrap;
             word-wrap: break-word;
-            line-height: 1.5;
+            overflow-wrap: break-word;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            font-size: 0.875rem;
+            line-height: 1.25rem;
+            tab-size: 4;
+            -moz-tab-size: 4;
+            letter-spacing: normal;
+            word-spacing: normal;
         }
 
         #dockerfile-highlight code {
             background: transparent !important;
             padding: 0 !important;
             margin: 0 !important;
-            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-            font-size: 0.875rem;
-            line-height: 1.5;
+            font-family: inherit;
+            font-size: inherit;
+            line-height: inherit;
             white-space: pre-wrap;
             word-wrap: break-word;
+            overflow-wrap: break-word;
+            display: block;
+            tab-size: inherit;
+            -moz-tab-size: inherit;
         }
 
-        /* Customize Prism token colors to match dark theme */
-        .token.comment,
-        .token.prolog {
-            color: #6b7280 !important; /* gray-500 */
+        /* Ensure spans inside code don't affect layout */
+        #dockerfile-highlight code span {
+            font-family: inherit;
+            font-size: inherit;
+            line-height: inherit;
+            letter-spacing: inherit;
+            word-spacing: inherit;
+            padding: 0;
+            margin: 0;
+            border: 0;
+            vertical-align: baseline;
         }
 
-        .token.keyword,
-        .token.builtin {
-            color: #60a5fa !important; /* blue-400 */
-            font-weight: 600;
+        /* Textarea styles to match overlay for perfect alignment */
+        #dockerfile-editor {
+            border: none !important;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            font-size: 0.875rem;
+            line-height: 1.25rem;
+            tab-size: 4;
+            -moz-tab-size: 4;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            overflow: auto;
+            letter-spacing: normal;
+            word-spacing: normal;
         }
 
-        .token.string,
-        .token.url {
-            color: #34d399 !important; /* green-400 */
-        }
-
-        .token.variable,
-        .token.constant {
-            color: #fbbf24 !important; /* yellow-400 */
-        }
-
-        .token.number {
-            color: #f87171 !important; /* red-400 */
-        }
-
-        .token.boolean {
-            color: #c084fc !important; /* purple-400 */
-        }
-
-        .token.operator,
-        .token.entity {
-            color: #9ca3af !important; /* gray-400 */
-        }
+        /* Shiki handles all syntax highlighting styles internally */
 
         /* Ensure placeholder is visible when textarea is empty */
         #dockerfile-editor::-webkit-input-placeholder {
@@ -1531,7 +1610,7 @@ ENTRYPOINT ["java", \\
             
             <!-- Editor Panel -->
             <div class="flex flex-col bg-gray-800 rounded-lg shadow-lg overflow-hidden border border-gray-700">
-                <div class="flex-shrink-0 p-3 bg-gray-700 border-b border-gray-600">
+                <div class="flex-shrink-0 bg-gray-700 border-b border-gray-600">
                     <div class="flex items-center justify-between mb-2">
                         <h2 class="text-lg font-semibold text-white">Dockerfile Editor</h2>
                         <div class="flex items-center space-x-3">
@@ -1569,7 +1648,7 @@ ENTRYPOINT ["java", \\
                     <!-- Syntax highlighting overlay container -->
                     <div class="relative w-full h-full">
                         <!-- Syntax-highlighted code display (background layer) -->
-                        <pre id="dockerfile-highlight" class="absolute top-0 left-0 w-full h-full p-3 m-0 overflow-auto font-mono text-sm pointer-events-none" style="background-color: #1f2937;"><code id="dockerfile-code" class="language-docker"><!--
+                        <pre id="dockerfile-highlight" class="absolute top-0 left-0 w-full h-full p-3 m-0 overflow-auto pointer-events-none" style="background-color: #1f2937;"><code id="dockerfile-code"><!--
 A multi-stage build example for a Node.js app.
 The 'builder' stage builds the app, and the final
 stage copies *only* the built files from 'builder'.
@@ -1593,7 +1672,7 @@ FROM alpine:latest AS helper
 RUN echo "This is a helper stage" > /hello.txt
 </code></pre>
                         <!-- Transparent textarea (foreground layer for input) -->
-                        <textarea id="dockerfile-editor" class="absolute top-0 left-0 w-full h-full p-3 font-mono text-sm resize-none outline-none" style="background-color: transparent; color: transparent; caret-color: #9ca3af; z-index: 1;" placeholder="Paste your Dockerfile here..." spellcheck="false"><!--
+                        <textarea id="dockerfile-editor" class="absolute top-0 left-0 w-full h-full p-3 resize-none outline-none" style="background-color: transparent; color: transparent; caret-color: #9ca3af; z-index: 1;" placeholder="Paste your Dockerfile here..." spellcheck="false"><!--
 A multi-stage build example for a Node.js app.
 The 'builder' stage builds the app, and the final
 stage copies *only* the built files from 'builder'.
@@ -1619,7 +1698,7 @@ RUN echo "This is a helper stage" > /hello.txt
                     </div>
                 </div>
                 <!-- Highlight Overlay -->
-                <div id="editor-highlight-overlay" class="hidden flex-shrink-0 bg-blue-600 text-white px-3 py-2 flex items-center justify-between text-sm">
+                <div id="editor-highlight-overlay" class="hidden flex-shrink-0 bg-blue-600 text-white flex items-center justify-between text-sm">
                     <span id="highlight-info">Command highlighted</span>
                     <button onclick="clearHighlights()" class="hover:text-gray-200 transition-colors">
                         <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
