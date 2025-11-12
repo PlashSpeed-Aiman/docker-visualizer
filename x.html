@@ -1,0 +1,1527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dockerfile Build Visualizer</title>
+    <!-- Load Tailwind CSS for styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Mermaid.js for graph rendering -->
+    <script type="module">
+        import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+        mermaid.initialize({
+            startOnLoad: false,
+            theme: 'forest',
+            securityLevel: 'loose' // Needed for click events
+        });
+    
+        // Global state to store parsed stage data
+        let stageData = {};
+        let currentView = 'graph'; // 'graph' or 'timeline' or 'glossary'
+        let saveTimeout = null;
+
+        // LocalStorage utilities
+        const STORAGE_KEYS = {
+            content: 'dockerVisualizer_content',
+            view: 'dockerVisualizer_view',
+            timestamp: 'dockerVisualizer_timestamp',
+            selectedExample: 'dockerVisualizer_selectedExample'
+        };
+
+        // Example Dockerfiles collection
+        const EXAMPLES = {
+            'single-stage-node': {
+                name: 'Single-Stage Node.js',
+                description: 'Simple single-stage build for a Node.js application',
+                content: `# Single-Stage Node.js Application
+# This is the simplest Dockerfile pattern - everything happens in one stage
+
+# Use official Node.js image as base
+# Alpine variant is smaller (~100MB vs ~900MB for full image)
+FROM node:18-alpine
+
+# Set working directory for all subsequent commands
+# This creates the directory if it doesn't exist
+WORKDIR /app
+
+# Copy package files first (before source code)
+# WHY: Docker caches layers - if package.json doesn't change,
+# npm install won't run again, saving build time
+COPY package*.json ./
+
+# Install dependencies
+# This layer will be cached unless package.json changes
+RUN npm install
+
+# Copy application source code
+# This is done AFTER npm install to maximize cache efficiency
+COPY . .
+
+# Document which port the app uses
+# Note: EXPOSE doesn't actually publish the port, it's documentation
+EXPOSE 3000
+
+# Define the command to run the application
+# CMD provides defaults that can be overridden at runtime
+CMD ["node", "server.js"]
+
+# PROS: Simple, easy to understand, fast builds for development
+# CONS: Large image size (~150-200MB), includes dev dependencies`
+            },
+            'multi-stage-node-nginx': {
+                name: 'Multi-Stage Node.js + Nginx',
+                description: 'Optimized multi-stage build separating build and runtime',
+                content: `# Multi-Stage Build: Node.js Application with Nginx
+# WHY MULTI-STAGE: Separates build tools from runtime, reducing final image size by 70-90%
+
+# ============================================
+# Stage 1: Builder - Contains build tools
+# ============================================
+FROM node:18-alpine AS builder
+
+# Set working directory for build stage
+WORKDIR /app
+
+# Copy dependency manifests first
+# Layer caching: These files change less frequently than source code
+COPY package*.json ./
+
+# Install ALL dependencies (including devDependencies)
+# These are needed for the build process but not for runtime
+RUN npm install
+
+# Copy source code
+COPY . .
+
+# Build the application (compilation, bundling, minification)
+# Output typically goes to /app/dist or /app/build
+RUN npm run build
+
+# ============================================
+# Stage 2: Production - Minimal runtime image
+# ============================================
+FROM nginx:1.25-alpine
+
+# Set working directory to nginx's default html location
+WORKDIR /usr/share/nginx/html
+
+# Copy ONLY the built artifacts from builder stage
+# WHY: We don't need source code, node_modules, or build tools in production
+# This line creates the dependency link shown in the visualization!
+COPY --from=builder /app/dist .
+
+# Expose HTTP port
+EXPOSE 80
+
+# Start nginx in foreground mode
+# 'daemon off' prevents nginx from backgrounding (required for containers)
+CMD ["nginx", "-g", "daemon off;"]
+
+# RESULT: Final image is ~25MB (nginx + static files) vs ~200MB (full Node.js image)
+# Build time increased slightly, but deployments are much faster
+
+# ============================================
+# Stage 3: Helper - Independent utility stage
+# ============================================
+FROM alpine:latest AS helper
+
+# This stage demonstrates that not all stages need to be used in final image
+# Useful for: generating configs, running tests, building tools
+RUN echo "This is a helper stage" > /hello.txt
+
+# This stage is NOT copied into any other stage, so it won't be in final images
+# Build tools can target specific stages: docker build --target=helper`
+            },
+            'scratch-go': {
+                name: 'Scratch-based Go Binary',
+                description: 'Minimal Go binary using scratch base for security',
+                content: `# Scratch-Based Go Application
+# WHY SCRATCH: Creates the smallest possible image (~5-15MB) with minimal attack surface
+
+# ============================================
+# Stage 1: Builder - Full Go environment
+# ============================================
+FROM golang:1.21-alpine AS builder
+
+# Install CA certificates and timezone data
+# WHY: Scratch has NOTHING - not even root certs or timezone info
+# Without these, HTTPS requests and time operations will fail
+RUN apk add --no-cache ca-certificates tzdata
+
+# Set working directory
+WORKDIR /app
+
+# Copy go module files first for dependency caching
+# Similar to package.json in Node.js
+COPY go.mod go.sum ./
+
+# Download dependencies
+# This layer is cached unless go.mod/go.sum change
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build the binary with specific flags
+# CGO_ENABLED=0: Build static binary (no C dependencies)
+# -ldflags="-w -s": Strip debug info to reduce binary size
+# -a: Force rebuild of all packages
+# -installsuffix cgo: Use separate package cache for static builds
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags='-w -s' -o main .
+
+# ============================================
+# Stage 2: Runtime - Scratch (empty) base
+# ============================================
+FROM scratch
+
+# Copy timezone data from builder
+# WHY: Applications often need timezone information for time operations
+COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
+
+# Copy CA certificates for HTTPS
+# WHY: Without these, HTTPS requests to external APIs will fail
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+
+# Copy the static binary from builder
+# This is the ONLY application file in the final image
+COPY --from=builder /app/main /main
+
+# Expose application port
+EXPOSE 8080
+
+# Run the binary
+# Note: We can't use a shell here (no /bin/sh exists in scratch)
+# So we use the JSON array syntax
+ENTRYPOINT ["/main"]
+
+# RESULT: Final image is ~5-15MB (just the binary + certs + timezone data)
+# SECURITY: No shell, no package manager, no libraries = minimal attack surface
+# LIMITATION: Can't exec into container for debugging (no shell exists)`
+            },
+            'python-venv': {
+                name: 'Python with Virtual Environment',
+                description: 'Python app with proper dependency management',
+                content: `# Python Application with Virtual Environment
+# WHY VENV: Isolates dependencies, reduces image size, improves reproducibility
+
+# ============================================
+# Stage 1: Builder - Build dependencies
+# ============================================
+FROM python:3.11-slim AS builder
+
+# Set Python environment variables
+# PYTHONDONTWRITEBYTECODE: Prevents Python from writing .pyc files
+# PYTHONUNBUFFERED: Forces stdout/stderr to be unbuffered (better logging)
+ENV PYTHONDONTWRITEBYTECODE=1 \\
+    PYTHONUNBUFFERED=1
+
+# Install system dependencies needed for building Python packages
+# WHY: Many Python packages (like psycopg2, pillow) need C libraries
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+    gcc \\
+    python3-dev \\
+    && rm -rf /var/lib/apt/lists/*
+
+# Create virtual environment
+# WHY: Keeps application dependencies separate from system Python
+RUN python -m venv /opt/venv
+
+# Activate virtual environment
+# All subsequent pip commands will install to this venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Copy requirements first for layer caching
+COPY requirements.txt .
+
+# Install Python dependencies
+# --no-cache-dir: Don't cache pip downloads (saves space)
+# --upgrade pip: Ensure we have latest pip for best compatibility
+RUN pip install --no-cache-dir --upgrade pip && \\
+    pip install --no-cache-dir -r requirements.txt
+
+# ============================================
+# Stage 2: Runtime - Clean production image
+# ============================================
+FROM python:3.11-slim
+
+# Set Python environment variables (same as builder)
+ENV PYTHONDONTWRITEBYTECODE=1 \\
+    PYTHONUNBUFFERED=1
+
+# Install only runtime dependencies (not build tools)
+# Example: libpq for PostgreSQL, but not gcc
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+    libpq5 \\
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user for security
+# WHY: Running as root is a security risk if container is compromised
+RUN useradd --create-home --shell /bin/bash appuser
+
+# Set working directory
+WORKDIR /app
+
+# Copy virtual environment from builder
+# WHY: Includes all installed packages without build tools
+COPY --from=builder /opt/venv /opt/venv
+
+# Copy application code
+COPY . .
+
+# Change ownership to non-root user
+RUN chown -R appuser:appuser /app
+
+# Switch to non-root user
+USER appuser
+
+# Activate virtual environment
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Expose application port
+EXPOSE 8000
+
+# Run the application
+CMD ["python", "app.py"]
+
+# RESULT: Smaller image than single-stage, no build tools in production
+# SECURITY: Non-root user, minimal system packages`
+            },
+            'optimized-caching': {
+                name: 'Optimized Layer Caching',
+                description: 'Demonstrates Docker layer caching best practices',
+                content: `# Optimized Docker Image - Layer Caching Best Practices
+# GOAL: Minimize build time by maximizing cache hits
+
+# ============================================
+# Stage 1: Dependencies - Rarely changes
+# ============================================
+FROM node:18-alpine AS dependencies
+
+WORKDIR /app
+
+# OPTIMIZATION 1: Copy only dependency files first
+# WHY: package.json changes less frequently than source code
+# If this layer is cached, npm install is skipped entirely
+COPY package.json package-lock.json ./
+
+# OPTIMIZATION 2: Use npm ci instead of npm install
+# WHY: npm ci is faster, more reliable, and requires package-lock.json
+# It deletes node_modules and does clean install (reproducible builds)
+RUN npm ci --only=production
+
+# Save production dependencies
+# We'll copy these to the final image later
+RUN cp -R node_modules /tmp/prod_modules
+
+# Now install dev dependencies for building
+RUN npm ci
+
+# ============================================
+# Stage 2: Builder - Build application
+# ============================================
+FROM node:18-alpine AS builder
+
+WORKDIR /app
+
+# Copy dependencies from previous stage
+# WHY: Reusing layers from dependencies stage
+COPY --from=dependencies /app/node_modules ./node_modules
+COPY package*.json ./
+
+# OPTIMIZATION 3: Copy files in order of change frequency
+# Config files (rarely change) before source code (changes often)
+COPY tsconfig.json ./
+COPY public ./public
+
+# Source code copied last (changes most frequently)
+COPY src ./src
+
+# Build the application
+RUN npm run build
+
+# ============================================
+# Stage 3: Production - Minimal runtime
+# ============================================
+FROM node:18-alpine
+
+# OPTIMIZATION 4: Install dumb-init for proper signal handling
+# WHY: Node.js doesn't handle SIGTERM properly, causes slow shutdowns
+RUN apk add --no-cache dumb-init
+
+# Create non-root user
+RUN addgroup -g 1001 -S nodejs && adduser -S nodejs -u 1001
+
+WORKDIR /app
+
+# OPTIMIZATION 5: Copy only production dependencies
+# WHY: Dev dependencies not needed in production (saves 50-70% of node_modules size)
+COPY --from=dependencies /tmp/prod_modules ./node_modules
+
+# Copy built application from builder
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/package.json ./
+
+# Change ownership
+RUN chown -R nodejs:nodejs /app
+
+# Switch to non-root user
+USER nodejs
+
+EXPOSE 3000
+
+# Use dumb-init to handle signals properly
+ENTRYPOINT ["dumb-init", "--"]
+
+# Run application
+CMD ["node", "dist/index.js"]
+
+# OPTIMIZATION RESULTS:
+# - Dependency changes: Only rebuild from 'dependencies' stage
+# - Config changes: Only rebuild from 'builder' stage
+# - Code changes: Only rebuild 'npm run build' and later
+# - Typical build time: 2-5 seconds (vs 60+ seconds without caching)
+# - Image size: ~150MB (vs ~300MB without optimization)`
+            },
+            'distroless-java': {
+                name: 'Distroless Java Application',
+                description: 'Security-hardened Java app with distroless base',
+                content: `# Distroless Java Application - Security Best Practices
+# WHY DISTROLESS: Contains only application and runtime dependencies
+# No shell, no package manager, no utilities = minimal attack surface
+
+# ============================================
+# Stage 1: Builder - Full JDK for compilation
+# ============================================
+FROM maven:3.9-eclipse-temurin-17 AS builder
+
+WORKDIR /app
+
+# Copy dependency descriptor first
+# WHY: Maven dependencies change less frequently than code
+COPY pom.xml ./
+
+# Download dependencies (cached layer)
+# This command fails gracefully if no code is present
+RUN mvn dependency:go-offline -B
+
+# Copy source code
+COPY src ./src
+
+# Build the application
+# -DskipTests: Skip tests during image build (run them in CI/CD instead)
+# -B: Batch mode (less verbose output)
+RUN mvn package -DskipTests -B
+
+# ============================================
+# Stage 2: Production - Distroless runtime
+# ============================================
+# Use Google's distroless Java 17 image
+# This image contains ONLY: Java runtime + CA certs + timezone data
+# Total size: ~200MB vs ~400MB for openjdk:17-slim
+FROM gcr.io/distroless/java17-debian12
+
+# Distroless images use non-root user by default
+# User 'nonroot' (UID 65532) is pre-configured
+
+WORKDIR /app
+
+# Copy JAR file from builder
+# Adjust the path based on your Maven artifactId
+COPY --from=builder /app/target/*.jar /app/application.jar
+
+# Expose application port
+EXPOSE 8080
+
+# LIMITATION: Cannot use ENTRYPOINT with shell form in distroless
+# Must use JSON array syntax (no shell available)
+# Pass JVM options as separate array elements
+ENTRYPOINT ["java", \\
+    "-XX:+UseContainerSupport", \\
+    "-XX:MaxRAMPercentage=75.0", \\
+    "-Djava.security.egd=file:/dev/./urandom", \\
+    "-jar", \\
+    "/app/application.jar"]
+
+# JVM FLAGS EXPLAINED:
+# -XX:+UseContainerSupport: Respect container memory limits
+# -XX:MaxRAMPercentage=75.0: Use max 75% of container memory for heap
+# -Djava.security.egd=file:/dev/./urandom: Use non-blocking random (faster startup)
+
+# SECURITY BENEFITS:
+# ✓ No shell (cannot exec into container for shell access)
+# ✓ No package manager (cannot install malware)
+# ✓ No unnecessary binaries (reduced attack surface)
+# ✓ Non-root user by default
+# ✓ Minimal CVE exposure (fewer packages = fewer vulnerabilities)
+
+# DEBUGGING LIMITATION:
+# Cannot use 'docker exec -it <container> /bin/sh'
+# Must use: docker exec <container> java <command>
+# Or enable debug port and use remote debugging
+
+# HEALTH CHECK (if needed):
+# Since distroless has no curl/wget, use Java's built-in HTTP client
+# Or expose JMX port for monitoring`
+            }
+        };
+
+        function saveToLocalStorage() {
+            const editor = document.getElementById('dockerfile-editor');
+            const content = editor.value;
+            const timestamp = new Date().toISOString();
+
+            localStorage.setItem(STORAGE_KEYS.content, content);
+            localStorage.setItem(STORAGE_KEYS.view, currentView);
+            localStorage.setItem(STORAGE_KEYS.timestamp, timestamp);
+
+            // Show saved indicator
+            showSaveIndicator();
+        }
+
+        window.loadExample = function(exampleKey) {
+            // If empty selection, do nothing
+            if (!exampleKey) return;
+
+            // Get the example from EXAMPLES object
+            const example = EXAMPLES[exampleKey];
+            if (!example) {
+                console.error('Example not found:', exampleKey);
+                return;
+            }
+
+            // Load content into editor
+            const editor = document.getElementById('dockerfile-editor');
+            editor.value = example.content;
+
+            // Save selected example to localStorage
+            localStorage.setItem(STORAGE_KEYS.selectedExample, exampleKey);
+
+            // Update visualization
+            updateVisualization();
+
+            // Save content to localStorage
+            saveToLocalStorage();
+
+            // Hide restore notification if visible
+            const notification = document.getElementById('restore-notification');
+            if (notification) {
+                notification.classList.add('hidden');
+            }
+
+            // Reset dropdown to default state
+            const selector = document.getElementById('example-selector');
+            if (selector) {
+                selector.value = '';
+            }
+        };
+
+        function loadFromLocalStorage() {
+            const savedContent = localStorage.getItem(STORAGE_KEYS.content);
+            const savedView = localStorage.getItem(STORAGE_KEYS.view);
+            const savedTimestamp = localStorage.getItem(STORAGE_KEYS.timestamp);
+
+            if (savedContent && savedTimestamp) {
+                const editor = document.getElementById('dockerfile-editor');
+                editor.value = savedContent;
+
+                if (savedView) {
+                    currentView = savedView;
+                }
+
+                // Show restore notification
+                showRestoreNotification(savedTimestamp);
+                return true;
+            }
+            return false;
+        }
+
+        function clearLocalStorage() {
+            localStorage.removeItem(STORAGE_KEYS.content);
+            localStorage.removeItem(STORAGE_KEYS.view);
+            localStorage.removeItem(STORAGE_KEYS.timestamp);
+            localStorage.removeItem(STORAGE_KEYS.selectedExample);
+
+            // Reset to default example (multi-stage-node-nginx)
+            const defaultExample = EXAMPLES['multi-stage-node-nginx'];
+            const editor = document.getElementById('dockerfile-editor');
+            editor.value = defaultExample.content;
+
+            currentView = 'graph';
+            updateVisualization();
+            switchView('graph');
+
+            // Reset dropdown
+            const selector = document.getElementById('example-selector');
+            if (selector) {
+                selector.value = '';
+            }
+
+            // Hide notification if visible
+            const notification = document.getElementById('restore-notification');
+            if (notification) {
+                notification.classList.add('hidden');
+            }
+        }
+
+        function showSaveIndicator() {
+            const indicator = document.getElementById('save-indicator');
+            if (indicator) {
+                indicator.classList.remove('opacity-0');
+                indicator.classList.add('opacity-100');
+
+                setTimeout(() => {
+                    indicator.classList.remove('opacity-100');
+                    indicator.classList.add('opacity-0');
+                }, 2000);
+            }
+        }
+
+        function showRestoreNotification(timestamp) {
+            const notification = document.getElementById('restore-notification');
+            const timeElement = document.getElementById('restore-time');
+
+            if (notification && timeElement) {
+                const date = new Date(timestamp);
+                const formattedTime = date.toLocaleString();
+                timeElement.textContent = formattedTime;
+                notification.classList.remove('hidden');
+            }
+        }
+
+        function dismissRestoreNotification() {
+            const notification = document.getElementById('restore-notification');
+            if (notification) {
+                notification.classList.add('hidden');
+            }
+        }
+
+        // Debounced auto-save function
+        function debouncedSave() {
+            if (saveTimeout) {
+                clearTimeout(saveTimeout);
+            }
+
+            saveTimeout = setTimeout(() => {
+                saveToLocalStorage();
+            }, 2000); // Save 2 seconds after user stops typing
+        }
+
+        // Dockerfile commands glossary
+        const GLOSSARY = [
+            {
+                command: 'FROM',
+                description: 'Sets the base image for subsequent instructions. First instruction in a Dockerfile.',
+                docsUrl: 'https://docs.docker.com/reference/dockerfile/#from',
+                color: 'text-blue-400'
+            },
+            {
+                command: 'RUN',
+                description: 'Executes commands in a new layer on top of the current image and commits the results.',
+                docsUrl: 'https://docs.docker.com/reference/dockerfile/#run',
+                color: 'text-blue-400'
+            },
+            {
+                command: 'CMD',
+                description: 'Provides defaults for executing a container. Only one CMD instruction per Dockerfile.',
+                docsUrl: 'https://docs.docker.com/reference/dockerfile/#cmd',
+                color: 'text-red-400'
+            },
+            {
+                command: 'ENTRYPOINT',
+                description: 'Configures a container to run as an executable. Overrides CMD.',
+                docsUrl: 'https://docs.docker.com/reference/dockerfile/#entrypoint',
+                color: 'text-red-400'
+            },
+            {
+                command: 'COPY',
+                description: 'Copies files or directories from source to the container filesystem at destination.',
+                docsUrl: 'https://docs.docker.com/reference/dockerfile/#copy',
+                color: 'text-purple-400'
+            },
+            {
+                command: 'ADD',
+                description: 'Similar to COPY but with additional features like URL handling and tar extraction.',
+                docsUrl: 'https://docs.docker.com/reference/dockerfile/#add',
+                color: 'text-purple-400'
+            },
+            {
+                command: 'ENV',
+                description: 'Sets environment variables that persist in the container and during build.',
+                docsUrl: 'https://docs.docker.com/reference/dockerfile/#env',
+                color: 'text-green-400'
+            },
+            {
+                command: 'ARG',
+                description: 'Defines build-time variables that can be passed with docker build --build-arg.',
+                docsUrl: 'https://docs.docker.com/reference/dockerfile/#arg',
+                color: 'text-cyan-400'
+            },
+            {
+                command: 'WORKDIR',
+                description: 'Sets the working directory for subsequent RUN, CMD, ENTRYPOINT, COPY, and ADD instructions.',
+                docsUrl: 'https://docs.docker.com/reference/dockerfile/#workdir',
+                color: 'text-yellow-400'
+            },
+            {
+                command: 'EXPOSE',
+                description: 'Documents which ports the container listens on at runtime. Does not publish ports.',
+                docsUrl: 'https://docs.docker.com/reference/dockerfile/#expose',
+                color: 'text-orange-400'
+            },
+            {
+                command: 'VOLUME',
+                description: 'Creates a mount point and marks it as holding externally mounted volumes.',
+                docsUrl: 'https://docs.docker.com/reference/dockerfile/#volume',
+                color: 'text-pink-400'
+            },
+            {
+                command: 'USER',
+                description: 'Sets the user (and optionally group) to use when running the image.',
+                docsUrl: 'https://docs.docker.com/reference/dockerfile/#user',
+                color: 'text-indigo-400'
+            },
+            {
+                command: 'LABEL',
+                description: 'Adds metadata to an image as key-value pairs.',
+                docsUrl: 'https://docs.docker.com/reference/dockerfile/#label',
+                color: 'text-gray-400'
+            },
+            {
+                command: 'HEALTHCHECK',
+                description: 'Tells Docker how to test a container to check if it is still working.',
+                docsUrl: 'https://docs.docker.com/reference/dockerfile/#healthcheck',
+                color: 'text-teal-400'
+            },
+            {
+                command: 'SHELL',
+                description: 'Overrides the default shell used for shell form of commands.',
+                docsUrl: 'https://docs.docker.com/reference/dockerfile/#shell',
+                color: 'text-lime-400'
+            },
+            {
+                command: 'ONBUILD',
+                description: 'Adds a trigger instruction when the image is used as a base for another build.',
+                docsUrl: 'https://docs.docker.com/reference/dockerfile/#onbuild',
+                color: 'text-amber-400'
+            },
+            {
+                command: 'STOPSIGNAL',
+                description: 'Sets the system call signal to send to the container to exit.',
+                docsUrl: 'https://docs.docker.com/reference/dockerfile/#stopsignal',
+                color: 'text-rose-400'
+            },
+            {
+                command: 'AS',
+                description: 'Multi-stage build keyword: names a build stage (used with FROM).',
+                docsUrl: 'https://docs.docker.com/build/building/multi-stage/',
+                color: 'text-emerald-400'
+            },
+            {
+                command: '--from',
+                description: 'Multi-stage build flag: references a previous stage in COPY command.',
+                docsUrl: 'https://docs.docker.com/build/building/multi-stage/',
+                color: 'text-violet-400'
+            }
+        ];
+
+        // Glossary search and render functions
+        function renderGlossary(searchTerm = '') {
+            const filtered = searchTerm
+                ? GLOSSARY.filter(entry =>
+                    entry.command.toLowerCase().includes(searchTerm.toLowerCase()) ||
+                    entry.description.toLowerCase().includes(searchTerm.toLowerCase())
+                )
+                : GLOSSARY;
+
+            const resultsCount = `<div class="text-sm text-gray-400 mb-4">${filtered.length} command${filtered.length !== 1 ? 's' : ''}</div>`;
+
+            const glossaryHTML = filtered.map(entry => `
+                <div class="glossary-card bg-gray-700 rounded-lg p-4 border border-gray-600 hover:border-blue-500 transition-all cursor-pointer"
+                     onclick="highlightCommandInEditor('${entry.command}')">
+                    <div class="flex items-start justify-between mb-2">
+                        <h3 class="text-lg font-bold font-mono ${entry.color}">${entry.command}</h3>
+                        <a href="${entry.docsUrl}"
+                           target="_blank"
+                           onclick="event.stopPropagation()"
+                           class="text-xs text-blue-400 hover:text-blue-300 flex items-center space-x-1">
+                            <span>View Docs</span>
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                            </svg>
+                        </a>
+                    </div>
+                    <p class="text-sm text-gray-300 leading-relaxed">${entry.description}</p>
+                </div>
+            `).join('');
+
+            return resultsCount + (glossaryHTML || '<div class="text-gray-500 text-center py-8">No commands found</div>');
+        }
+
+        function searchGlossary() {
+            const searchInput = document.getElementById('glossary-search');
+            const glossaryContainer = document.getElementById('glossary-container');
+            const searchTerm = searchInput.value.trim();
+
+            glossaryContainer.innerHTML = renderGlossary(searchTerm);
+        }
+
+        function highlightCommandInEditor(command) {
+            const editor = document.getElementById('dockerfile-editor');
+            const content = editor.value;
+
+            // Clear previous highlights
+            clearHighlights();
+
+            // Find all occurrences of the command
+            const regex = new RegExp(`^${command}\\b`, 'gim');
+            const matches = [...content.matchAll(regex)];
+
+            if (matches.length > 0) {
+                // Show highlight overlay
+                const highlightOverlay = document.getElementById('editor-highlight-overlay');
+                if (highlightOverlay) {
+                    highlightOverlay.classList.remove('hidden');
+
+                    // Add highlight info
+                    const highlightInfo = document.getElementById('highlight-info');
+                    highlightInfo.textContent = `${matches.length} occurrence${matches.length !== 1 ? 's' : ''} of ${command} highlighted`;
+                }
+
+                // Focus editor and scroll to first match
+                editor.focus();
+                const firstMatchIndex = matches[0].index;
+                editor.setSelectionRange(firstMatchIndex, firstMatchIndex + command.length);
+                editor.scrollTop = 0; // Simple scroll to top where first match likely is
+            }
+        }
+
+        function clearHighlights() {
+            const highlightOverlay = document.getElementById('editor-highlight-overlay');
+            if (highlightOverlay) {
+                highlightOverlay.classList.add('hidden');
+            }
+
+            // Clear editor selection
+            const editor = document.getElementById('dockerfile-editor');
+            if (editor) {
+                editor.setSelectionRange(0, 0);
+            }
+        }
+
+        // Function to parse Dockerfile content and generate Mermaid graph definition
+        function parseDockerfile(content) {
+            const lines = content.split('\n');
+            let graph = 'graph TD;\n';
+            let stages = {};
+            let currentStage = null;
+            let stageCounter = 0;
+            const finalStages = new Set();
+            stageData = {}; // Reset global stage data
+
+            const styleMap = {
+                base: 'fill:#3A86FF,stroke:#333,stroke-width:2px,color:#fff',
+                stage: 'fill:#FFBE0B,stroke:#333,stroke-width:2px,color:#333',
+                final: 'fill:#FB5607,stroke:#333,stroke-width:4px,color:#fff',
+                copy: 'stroke:#8338EC,stroke-width:2px,color:8338EC'
+            };
+
+            lines.forEach(line => {
+                const trimmedLine = line.trim();
+
+                // Skip empty lines and comments (but store them in stage data)
+                if (!trimmedLine || trimmedLine.startsWith('#')) {
+                    if (currentStage && trimmedLine) {
+                        stageData[currentStage].commands.push({ type: 'COMMENT', line: trimmedLine });
+                    }
+                    return;
+                }
+
+                // Match 'FROM ... AS ...'
+                const fromAsMatch = trimmedLine.match(/^FROM\s+([^\s]+)\s+AS\s+([^\s]+)/i);
+                if (fromAsMatch) {
+                    const baseImage = fromAsMatch[1];
+                    const stageName = fromAsMatch[2];
+
+                    currentStage = stageName;
+                    stages[stageName] = { base: baseImage, index: stageCounter };
+
+                    // Initialize stage data
+                    stageData[stageName] = {
+                        name: stageName,
+                        index: stageCounter,
+                        baseImage: baseImage,
+                        commands: [],
+                        dependencies: [],
+                        dependents: []
+                    };
+
+                    // Add nodes and link with click event
+                    graph += `    ${baseImage}[["${baseImage}"]]:::base;\n`;
+                    graph += `    ${stageName}(["${stageName} <br><i>(Stage ${stageCounter})</i>"]):::stage;\n`;
+                    graph += `    click ${stageName} call showStageDetails('${stageName}');\n`;
+                    graph += `    ${baseImage} --> ${stageName};\n`;
+
+                    finalStages.add(stageName);
+                    stageCounter++;
+                    return;
+                }
+
+                // Match 'FROM ...' (no AS)
+                const fromMatch = trimmedLine.match(/^FROM\s+([^\s]+)/i);
+                if (fromMatch) {
+                    const baseImage = fromMatch[1];
+                    const stageName = `stage${stageCounter}`;
+
+                    currentStage = stageName;
+                    stages[stageName] = { base: baseImage, index: stageCounter };
+
+                    // Initialize stage data
+                    stageData[stageName] = {
+                        name: stageName === `stage${stageCounter}` ? `Unnamed Stage ${stageCounter}` : stageName,
+                        index: stageCounter,
+                        baseImage: baseImage,
+                        commands: [],
+                        dependencies: [],
+                        dependents: []
+                    };
+
+                    // Add nodes and link with click event
+                    graph += `    ${baseImage}[["${baseImage}"]]:::base;\n`;
+                    graph += `    ${stageName}(["Final Image <br><i>(Stage ${stageCounter})</i>"]):::stage;\n`;
+                    graph += `    click ${stageName} call showStageDetails('${stageName}');\n`;
+                    graph += `    ${baseImage} --> ${stageName};\n`;
+
+                    finalStages.add(stageName);
+                    stageCounter++;
+                    return;
+                }
+
+                // Capture all other commands for the current stage
+                if (currentStage) {
+                    const commandMatch = trimmedLine.match(/^([A-Z]+)\s+(.*)/);
+                    if (commandMatch) {
+                        const [, command, args] = commandMatch;
+                        stageData[currentStage].commands.push({
+                            type: command,
+                            line: trimmedLine
+                        });
+
+                        // Match 'COPY --from=...'
+                        if (command === 'COPY') {
+                            const copyFromMatch = trimmedLine.match(/--from=([^\s]+)/i);
+                            if (copyFromMatch) {
+                                const fromStage = copyFromMatch[1];
+                                const fromStageName = isNaN(fromStage) ? fromStage : `stage${fromStage}`;
+
+                                if (stages[fromStageName]) {
+                                    graph += `    ${fromStageName} -.->|COPY| ${currentStage};\n`;
+                                    finalStages.delete(fromStageName);
+
+                                    // Track dependencies
+                                    stageData[currentStage].dependencies.push(fromStageName);
+                                    if (stageData[fromStageName]) {
+                                        stageData[fromStageName].dependents.push(currentStage);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            // Apply 'final' styling to stages that are not copied from
+            finalStages.forEach(stageName => {
+                stageData[stageName].isFinal = true;
+
+                if (stageName === `stage${stageCounter - 1}`) {
+                     graph = graph.replace(
+                        `${stageName}(["Final Image <br><i>(Stage ${stages[stageName].index})</i>"]):::stage;`,
+                        `${stageName}(["Final Image <br><i>(Stage ${stages[stageName].index})</i>"]):::final;`
+                    );
+                } else {
+                     graph = graph.replace(
+                        `${stageName}(["${stageName} <br><i>(Stage ${stages[stageName].index})</i>"]):::stage;`,
+                        `${stageName}(["${stageName} <br><i>(Stage ${stages[stageName].index})</i>"]):::final;`
+                    );
+                }
+            });
+
+
+            // Add style definitions
+            graph += `\n    classDef base ${styleMap.base};\n`;
+            graph += `    classDef stage ${styleMap.stage};\n`;
+            graph += `    classDef final ${styleMap.final};\n`;
+            graph += `    linkStyle default ${styleMap.copy};\n`; // Style for COPY links
+            
+            // Style for FROM links
+            Object.keys(stages).forEach(stageName => {
+                 graph += `    linkStyle ${Object.keys(stages).indexOf(stageName)} stroke:#333,stroke-width:2px;\n`;
+            });
+
+
+            return graph;
+        }
+
+        // Function to calculate build order using topological sort
+        function calculateBuildOrder() {
+            const allStages = Object.keys(stageData);
+            const buildLevels = [];
+
+            // Calculate depth for each stage (for parallel grouping)
+            function getDepth(stageName, memo = {}) {
+                if (memo[stageName] !== undefined) return memo[stageName];
+
+                const deps = stageData[stageName].dependencies;
+                if (deps.length === 0) {
+                    memo[stageName] = 0;
+                    return 0;
+                }
+
+                const maxDepth = Math.max(...deps.map(d => getDepth(d, memo)));
+                memo[stageName] = maxDepth + 1;
+                return maxDepth + 1;
+            }
+
+            // Group stages by depth (parallel build levels)
+            const depthMap = {};
+            allStages.forEach(stage => {
+                const depth = getDepth(stage);
+                if (!depthMap[depth]) depthMap[depth] = [];
+                depthMap[depth].push(stage);
+            });
+
+            // Convert to array of levels
+            const maxDepth = Math.max(...Object.keys(depthMap).map(Number));
+            for (let i = 0; i <= maxDepth; i++) {
+                if (depthMap[i]) {
+                    buildLevels.push(depthMap[i]);
+                }
+            }
+
+            return buildLevels;
+        }
+
+        // Function to generate timeline visualization
+        function generateTimeline() {
+            const buildLevels = calculateBuildOrder();
+            let timelineHTML = '<div class="space-y-6 p-4">';
+
+            buildLevels.forEach((level, levelIndex) => {
+                timelineHTML += `
+                    <div class="timeline-level">
+                        <div class="text-xs font-semibold text-gray-400 mb-2">
+                            Build Level ${levelIndex + 1}
+                            ${level.length > 1 ? '<span class="text-green-400">(Parallel Build)</span>' : ''}
+                        </div>
+                        <div class="space-y-2">
+                `;
+
+                level.forEach(stageName => {
+                    const stage = stageData[stageName];
+                    const isFinal = stage.isFinal;
+                    const bgColor = isFinal ? 'bg-orange-600' : 'bg-yellow-600';
+                    const borderColor = isFinal ? 'border-orange-400' : 'border-yellow-400';
+
+                    timelineHTML += `
+                        <div class="timeline-bar ${bgColor} ${borderColor} border-2 rounded-lg p-3 cursor-pointer hover:opacity-80 transition-opacity"
+                             onclick="showStageDetails('${stageName}')">
+                            <div class="flex items-center justify-between">
+                                <div>
+                                    <div class="font-semibold text-white">${stage.name}</div>
+                                    <div class="text-xs text-gray-200">
+                                        From: ${stage.baseImage} |
+                                        Commands: ${stage.commands.length}
+                                        ${stage.dependencies.length > 0 ? ` | Depends on: ${stage.dependencies.join(', ')}` : ''}
+                                    </div>
+                                </div>
+                                <div class="text-xs text-white font-mono bg-black bg-opacity-30 px-2 py-1 rounded">
+                                    Stage ${stage.index}
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                });
+
+                timelineHTML += `
+                        </div>
+                    </div>
+                `;
+            });
+
+            timelineHTML += '</div>';
+            return timelineHTML;
+        }
+
+        // Function to show stage details in side panel
+        window.showStageDetails = function(stageName) {
+            const stage = stageData[stageName];
+            if (!stage) return;
+
+            const panel = document.getElementById('details-panel');
+            const panelContent = document.getElementById('panel-content');
+
+            let commandsHTML = stage.commands.length > 0
+                ? stage.commands.map(cmd => {
+                    const typeColor = {
+                        'RUN': 'text-blue-400',
+                        'COPY': 'text-purple-400',
+                        'ADD': 'text-purple-400',
+                        'ENV': 'text-green-400',
+                        'WORKDIR': 'text-yellow-400',
+                        'EXPOSE': 'text-orange-400',
+                        'CMD': 'text-red-400',
+                        'ENTRYPOINT': 'text-red-400',
+                        'ARG': 'text-cyan-400',
+                        'COMMENT': 'text-gray-500'
+                    }[cmd.type] || 'text-gray-300';
+
+                    return `<div class="font-mono text-sm ${typeColor} mb-1">${cmd.line}</div>`;
+                }).join('')
+                : '<div class="text-gray-500 italic">No commands in this stage</div>';
+
+            const depsHTML = stage.dependencies.length > 0
+                ? stage.dependencies.map(dep =>
+                    `<span class="inline-block bg-purple-600 text-white px-2 py-1 rounded text-xs mr-2 mb-2">${dep}</span>`
+                ).join('')
+                : '<span class="text-gray-500 italic">None</span>';
+
+            const dependentsHTML = stage.dependents.length > 0
+                ? stage.dependents.map(dep =>
+                    `<span class="inline-block bg-orange-600 text-white px-2 py-1 rounded text-xs mr-2 mb-2">${dep}</span>`
+                ).join('')
+                : '<span class="text-gray-500 italic">None</span>';
+
+            panelContent.innerHTML = `
+                <div class="space-y-4">
+                    <div>
+                        <h3 class="text-2xl font-bold text-white mb-2">${stage.name}</h3>
+                        <div class="flex items-center space-x-2">
+                            <span class="inline-block bg-blue-600 text-white px-2 py-1 rounded text-xs">
+                                Stage ${stage.index}
+                            </span>
+                            ${stage.isFinal ? '<span class="inline-block bg-orange-600 text-white px-2 py-1 rounded text-xs">Final Stage</span>' : ''}
+                        </div>
+                    </div>
+
+                    <div class="border-t border-gray-700 pt-4">
+                        <h4 class="text-sm font-semibold text-gray-400 uppercase mb-2">Base Image</h4>
+                        <div class="font-mono text-blue-300">${stage.baseImage}</div>
+                    </div>
+
+                    <div class="border-t border-gray-700 pt-4">
+                        <h4 class="text-sm font-semibold text-gray-400 uppercase mb-2">
+                            Commands (${stage.commands.length})
+                        </h4>
+                        <div class="bg-gray-900 rounded p-3 max-h-64 overflow-y-auto">
+                            ${commandsHTML}
+                        </div>
+                    </div>
+
+                    <div class="border-t border-gray-700 pt-4">
+                        <h4 class="text-sm font-semibold text-gray-400 uppercase mb-2">Dependencies</h4>
+                        <div>${depsHTML}</div>
+                    </div>
+
+                    <div class="border-t border-gray-700 pt-4">
+                        <h4 class="text-sm font-semibold text-gray-400 uppercase mb-2">Used By</h4>
+                        <div>${dependentsHTML}</div>
+                    </div>
+
+                    <div class="border-t border-gray-700 pt-4">
+                        <h4 class="text-sm font-semibold text-gray-400 uppercase mb-2">Summary</h4>
+                        <div class="text-sm text-gray-300">
+                            <div>• Build Order: Level ${calculateBuildOrder().findIndex(level => level.includes(stageName)) + 1}</div>
+                            <div>• Total Commands: ${stage.commands.length}</div>
+                            <div>• Direct Dependencies: ${stage.dependencies.length}</div>
+                            <div>• Used by ${stage.dependents.length} stage(s)</div>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            // Show panel with animation
+            panel.classList.remove('translate-x-full');
+            panel.classList.add('translate-x-0');
+        };
+
+        // Function to close details panel
+        window.closeDetailsPanel = function() {
+            const panel = document.getElementById('details-panel');
+            panel.classList.remove('translate-x-0');
+            panel.classList.add('translate-x-full');
+        };
+
+        // Function to switch between views
+        window.switchView = function(view) {
+            currentView = view;
+            const graphContainer = document.getElementById('graph-view');
+            const timelineContainer = document.getElementById('timeline-view');
+            const glossaryContainer = document.getElementById('glossary-view');
+            const graphTab = document.getElementById('graph-tab');
+            const timelineTab = document.getElementById('timeline-tab');
+            const glossaryTab = document.getElementById('glossary-tab');
+            const graphLegend = document.getElementById('graph-legend');
+
+            // Clear all highlights when switching views
+            clearHighlights();
+
+            // Hide all views
+            graphContainer.classList.add('hidden');
+            timelineContainer.classList.add('hidden');
+            glossaryContainer.classList.add('hidden');
+
+            // Reset all tabs
+            [graphTab, timelineTab, glossaryTab].forEach(tab => {
+                tab.classList.remove('bg-blue-600', 'text-white');
+                tab.classList.add('bg-gray-700', 'text-gray-300');
+            });
+
+            // Show selected view and activate tab
+            if (view === 'graph') {
+                graphContainer.classList.remove('hidden');
+                graphLegend.classList.remove('hidden');
+                graphTab.classList.add('bg-blue-600', 'text-white');
+                graphTab.classList.remove('bg-gray-700', 'text-gray-300');
+            } else if (view === 'timeline') {
+                timelineContainer.classList.remove('hidden');
+                graphLegend.classList.add('hidden');
+                timelineTab.classList.add('bg-blue-600', 'text-white');
+                timelineTab.classList.remove('bg-gray-700', 'text-gray-300');
+                // Update timeline
+                timelineContainer.innerHTML = generateTimeline();
+            } else if (view === 'glossary') {
+                glossaryContainer.classList.remove('hidden');
+                graphLegend.classList.add('hidden');
+                glossaryTab.classList.add('bg-blue-600', 'text-white');
+                glossaryTab.classList.remove('bg-gray-700', 'text-gray-300');
+                // Update glossary
+                const glossaryContent = document.getElementById('glossary-container');
+                glossaryContent.innerHTML = renderGlossary();
+            }
+
+            // Save view preference
+            saveToLocalStorage();
+        };
+
+        // Main function to update visualization
+        async function updateVisualization() {
+            const editor = document.getElementById('dockerfile-editor');
+            const graphContainer = document.getElementById('graph-container');
+
+            const dockerfileContent = editor.value;
+            const mermaidGraph = parseDockerfile(dockerfileContent);
+
+            try {
+                // Update the Mermaid diagram
+                const { svg } = await mermaid.render('mermaid-graph', mermaidGraph);
+                graphContainer.innerHTML = svg;
+
+                // Update timeline if that's the current view
+                if (currentView === 'timeline') {
+                    const timelineContainer = document.getElementById('timeline-view');
+                    timelineContainer.innerHTML = generateTimeline();
+                }
+            } catch (e) {
+                graphContainer.innerHTML = `<pre class="text-red-400 p-4">Error parsing Dockerfile:\n${e.message}</pre>`;
+            }
+        }
+
+        // Run on load and on editor input
+        window.onload = () => {
+            const editor = document.getElementById('dockerfile-editor');
+
+            // Try to restore from localStorage
+            const restored = loadFromLocalStorage();
+
+            // If nothing was restored, load default example
+            if (!restored) {
+                const defaultExample = EXAMPLES['multi-stage-node-nginx'];
+                editor.value = defaultExample.content;
+            }
+
+            // Add event listeners
+            editor.addEventListener('input', () => {
+                updateVisualization();
+                debouncedSave(); // Auto-save after user stops typing
+            });
+
+            // Initial render
+            updateVisualization();
+
+            // Restore previous view if applicable
+            if (restored && currentView) {
+                switchView(currentView);
+            }
+        };
+    </script>
+    <style>
+        /* Custom styles for Mermaid nodes */
+        .mermaid .node rect, .mermaid .node circle, .mermaid .node polygon {
+            transition: all 0.3s ease;
+        }
+        .mermaid .label {
+            font-family: 'Inter', sans-serif;
+            font-weight: 600;
+        }
+
+        /* Side panel animation */
+        #details-panel {
+            transition: transform 0.3s ease-in-out;
+        }
+
+        /* Timeline styles */
+        .timeline-bar {
+            transition: all 0.2s ease;
+        }
+        .timeline-bar:hover {
+            transform: translateX(4px);
+        }
+
+        /* Glossary card styles */
+        .glossary-card {
+            transition: all 0.2s ease;
+        }
+        .glossary-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
+        }
+
+        /* Editor highlight overlay animation */
+        #editor-highlight-overlay {
+            animation: slideDown 0.3s ease-out;
+        }
+
+        @keyframes slideDown {
+            from {
+                opacity: 0;
+                transform: translateY(-10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        /* Notification banner animation */
+        #restore-notification {
+            animation: slideDown 0.3s ease-out;
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-gray-200 font-sans antialiased" style="font-family: 'Inter', sans-serif;">
+
+    <div class="flex flex-col h-screen">
+        <!-- Header -->
+        <header class="bg-gray-800 shadow-md border-b border-gray-700">
+            <div class="container mx-auto px-4 py-3">
+                <h1 class="text-2xl font-bold text-white">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-6 h-6 inline-block mr-2 -mt-1 text-blue-400">
+                        <path d="M22.521 3.623A2.25 2.25 0 0 0 20.318 2.25H3.682c-.97 0-1.847.625-2.14 1.54L.07 8.25h23.86l-1.409-4.627ZM3.682 3.75h16.636l1.209 3.99H2.472l1.21-3.99Z" />
+                        <path fill-rule="evenodd" d="M.098 9.75h23.804l-.31 9.303a2.25 2.25 0 0 1-2.247 2.197H2.654a2.25 2.25 0 0 1-2.247-2.197L.098 9.75Zm1.87 1.5h19.964l.217 6.522a.75.75 0 0 1-.749.728H2.592a.75.75 0 0 1-.749-.728L1.968 11.25Z" clip-rule="evenodd" />
+                    </svg>
+                    Dockerfile Build Visualizer
+                </h1>
+            </div>
+        </header>
+
+        <!-- Restore Notification Banner -->
+        <div id="restore-notification" class="hidden bg-blue-600 text-white px-4 py-2 flex items-center justify-between">
+            <div class="flex items-center space-x-2">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                    <path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clip-rule="evenodd" />
+                </svg>
+                <span class="text-sm">
+                    Restored previous session from <span id="restore-time" class="font-semibold"></span>
+                </span>
+            </div>
+            <button onclick="dismissRestoreNotification()" class="hover:text-gray-200 transition-colors">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                    <path fill-rule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clip-rule="evenodd" />
+                </svg>
+            </button>
+        </div>
+
+        <!-- Main Content -->
+        <div class="flex-grow grid grid-cols-1 md:grid-cols-2 gap-4 p-4 h-full overflow-hidden">
+            
+            <!-- Editor Panel -->
+            <div class="flex flex-col bg-gray-800 rounded-lg shadow-lg overflow-hidden border border-gray-700">
+                <div class="flex-shrink-0 p-3 bg-gray-700 border-b border-gray-600">
+                    <div class="flex items-center justify-between mb-2">
+                        <h2 class="text-lg font-semibold text-white">Dockerfile Editor</h2>
+                        <div class="flex items-center space-x-3">
+                            <!-- Save Indicator -->
+                            <span id="save-indicator" class="text-xs text-green-400 opacity-0 transition-opacity duration-300">
+                                ✓ Saved
+                            </span>
+                            <!-- Clear Button -->
+                            <button onclick="clearLocalStorage()"
+                                    class="px-3 py-1 text-xs bg-red-600 hover:bg-red-700 text-white rounded transition-colors"
+                                    title="Clear and reset to default">
+                                Clear & Reset
+                            </button>
+                        </div>
+                    </div>
+                    <!-- Example Selector -->
+                    <div class="flex items-center space-x-2">
+                        <label for="example-selector" class="text-sm text-gray-300 whitespace-nowrap">
+                            Load Example:
+                        </label>
+                        <select id="example-selector"
+                                onchange="loadExample(this.value)"
+                                class="flex-grow px-2 py-1 text-sm bg-gray-600 border border-gray-500 rounded text-white focus:outline-none focus:border-blue-500 transition-colors cursor-pointer">
+                            <option value="">-- Select an example --</option>
+                            <option value="single-stage-node">Single-Stage Node.js</option>
+                            <option value="multi-stage-node-nginx">Multi-Stage Node.js + Nginx</option>
+                            <option value="scratch-go">Scratch-based Go Binary</option>
+                            <option value="python-venv">Python with Virtual Environment</option>
+                            <option value="optimized-caching">Optimized Layer Caching</option>
+                            <option value="distroless-java">Distroless Java Application</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="flex-grow p-0">
+                    <textarea id="dockerfile-editor" class="w-full h-full p-3 bg-gray-900 text-gray-300 font-mono text-sm resize-none outline-none" placeholder="Paste your Dockerfile here..."><!-- 
+A multi-stage build example for a Node.js app.
+The 'builder' stage builds the app, and the final
+stage copies *only* the built files from 'builder'.
+-->
+FROM node:18-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+RUN npm run build
+
+FROM nginx:1.25-alpine
+WORKDIR /usr/share/nginx/html
+# This line creates the dependency link!
+COPY --from=builder /app/dist .
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+
+# Add another independent image for demo
+FROM alpine:latest AS helper
+RUN echo "This is a helper stage" > /hello.txt
+</textarea>
+                </div>
+                <!-- Highlight Overlay -->
+                <div id="editor-highlight-overlay" class="hidden flex-shrink-0 bg-blue-600 text-white px-3 py-2 flex items-center justify-between text-sm">
+                    <span id="highlight-info">Command highlighted</span>
+                    <button onclick="clearHighlights()" class="hover:text-gray-200 transition-colors">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                            <path fill-rule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clip-rule="evenodd" />
+                        </svg>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Visualization Panel -->
+            <div class="flex flex-col bg-gray-800 rounded-lg shadow-lg overflow-hidden border border-gray-700">
+                <!-- View Switcher Tabs -->
+                <div class="flex-shrink-0 p-3 bg-gray-700 border-b border-gray-600">
+                    <div class="flex items-center justify-between">
+                        <h2 class="text-lg font-semibold text-white">Visualization</h2>
+                        <div class="flex space-x-2">
+                            <button id="graph-tab"
+                                    onclick="switchView('graph')"
+                                    class="px-3 py-1 rounded text-sm font-medium transition-colors bg-blue-600 text-white">
+                                Dependency Graph
+                            </button>
+                            <button id="timeline-tab"
+                                    onclick="switchView('timeline')"
+                                    class="px-3 py-1 rounded text-sm font-medium transition-colors bg-gray-700 text-gray-300">
+                                Build Timeline
+                            </button>
+                            <button id="glossary-tab"
+                                    onclick="switchView('glossary')"
+                                    class="px-3 py-1 rounded text-sm font-medium transition-colors bg-gray-700 text-gray-300">
+                                Glossary
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Graph View -->
+                <div id="graph-view" class="flex-grow p-4 overflow-auto flex items-center justify-center">
+                    <div id="graph-container" class="w-full h-full">
+                        <!-- Mermaid graph will be rendered here -->
+                        <div id="mermaid-graph"></div>
+                    </div>
+                </div>
+
+                <!-- Timeline View -->
+                <div id="timeline-view" class="hidden flex-grow overflow-auto">
+                    <!-- Timeline will be rendered here -->
+                </div>
+
+                <!-- Glossary View -->
+                <div id="glossary-view" class="hidden flex-grow overflow-auto">
+                    <div class="p-4">
+                        <!-- Search Bar -->
+                        <div class="mb-6 sticky top-0 bg-gray-800 pb-4 z-10">
+                            <div class="flex items-center space-x-2 mb-2">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                                </svg>
+                                <input type="text"
+                                       id="glossary-search"
+                                       oninput="searchGlossary()"
+                                       placeholder="Search commands..."
+                                       class="flex-grow px-3 py-2 bg-gray-700 border border-gray-600 rounded text-white text-sm focus:outline-none focus:border-blue-500 transition-colors">
+                            </div>
+                            <p class="text-xs text-gray-400">Click any command to highlight it in your Dockerfile</p>
+                        </div>
+
+                        <!-- Glossary Content -->
+                        <div id="glossary-container" class="space-y-3">
+                            <!-- Glossary cards will be rendered here -->
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Legend (only for graph view) -->
+                <div id="graph-legend" class="flex-shrink-0 p-3 bg-gray-700 border-t border-gray-600">
+                    <h3 class="text-md font-semibold text-white mb-2">Legend</h3>
+                    <div class="flex flex-wrap gap-4 text-sm">
+                        <div class="flex items-center">
+                            <span class="w-4 h-4 rounded-full mr-2" style="background-color: #3A86FF; border: 1px solid #fff;"></span>
+                            <span>Base Image</span>
+                        </div>
+                        <div class="flex items-center">
+                            <span class="w-4 h-4 rounded-md mr-2" style="background-color: #FFBE0B; border: 1px solid #333;"></span>
+                            <span>Build Stage</span>
+                        </div>
+                        <div class="flex items-center">
+                            <span class="w-4 h-4 rounded-md mr-2" style="background-color: #FB5607; border: 2px solid #fff;"></span>
+                            <span>Final Stage</span>
+                        </div>
+                        <div class="flex items-center">
+                            <span class="w-6 h-0.5 mr-2" style="background-color: #8338EC;"></span>
+                            <span>COPY --from</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Side Panel for Stage Details -->
+    <div id="details-panel"
+         class="fixed top-0 right-0 h-full w-96 bg-gray-800 border-l border-gray-700 shadow-2xl transform translate-x-full z-50 overflow-y-auto">
+        <div class="sticky top-0 bg-gray-700 p-4 border-b border-gray-600 flex items-center justify-between">
+            <h2 class="text-xl font-bold text-white">Stage Details</h2>
+            <button onclick="closeDetailsPanel()"
+                    class="text-gray-400 hover:text-white transition-colors">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+            </button>
+        </div>
+        <div id="panel-content" class="p-4">
+            <!-- Content will be populated by showStageDetails() -->
+        </div>
+    </div>
+
+</body>
+</html>

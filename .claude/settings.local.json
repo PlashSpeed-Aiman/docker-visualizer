@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(start \"\" \"C:\\Projects\\DockerVisualizer\\x.html\")",
+      "Bash(dir \"C:\\Projects\\DockerVisualizer\")",
+      "Bash(powershell:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
