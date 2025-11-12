@@ -6,6 +6,10 @@
     <title>Dockerfile Build Visualizer</title>
     <!-- Load Tailwind CSS for styling -->
     <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Prism.js for syntax highlighting -->
+    <link href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet" />
+    <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-docker.min.js"></script>
     <!-- Load Mermaid.js for graph rendering -->
     <script type="module">
         import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
@@ -499,6 +503,9 @@ ENTRYPOINT ["java", \\
             // Update visualization
             updateVisualization();
 
+            // Update syntax highlighting
+            syncSyntaxHighlighting();
+
             // Save content to localStorage
             saveToLocalStorage();
 
@@ -548,6 +555,7 @@ ENTRYPOINT ["java", \\
 
             currentView = 'graph';
             updateVisualization();
+            syncSyntaxHighlighting(); // Update syntax highlighting
             switchView('graph');
 
             // Reset dropdown
@@ -1275,6 +1283,20 @@ ENTRYPOINT ["java", \\
             }
         }
 
+        // Sync syntax highlighting overlay with textarea content
+        function syncSyntaxHighlighting() {
+            const editor = document.getElementById('dockerfile-editor');
+            const codeElement = document.getElementById('dockerfile-code');
+
+            if (editor && codeElement && typeof Prism !== 'undefined') {
+                // Update code content
+                codeElement.textContent = editor.value;
+
+                // Apply Prism syntax highlighting
+                Prism.highlightElement(codeElement);
+            }
+        }
+
         // Run on load and on editor input
         window.onload = () => {
             const editor = document.getElementById('dockerfile-editor');
@@ -1292,10 +1314,21 @@ ENTRYPOINT ["java", \\
             editor.addEventListener('input', () => {
                 updateVisualization();
                 debouncedSave(); // Auto-save after user stops typing
+                syncSyntaxHighlighting(); // Update syntax highlighting
+            });
+
+            // Sync scroll between textarea and syntax highlight overlay
+            const highlightPre = document.getElementById('dockerfile-highlight');
+            editor.addEventListener('scroll', () => {
+                if (highlightPre) {
+                    highlightPre.scrollTop = editor.scrollTop;
+                    highlightPre.scrollLeft = editor.scrollLeft;
+                }
             });
 
             // Initial render
             updateVisualization();
+            syncSyntaxHighlighting(); // Initial syntax highlighting
 
             // Restore previous view if applicable
             if (restored && currentView) {
@@ -1304,6 +1337,73 @@ ENTRYPOINT ["java", \\
         };
     </script>
     <style>
+        /* Syntax highlighting overlay styles */
+        #dockerfile-highlight {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            line-height: 1.5;
+        }
+
+        #dockerfile-highlight code {
+            background: transparent !important;
+            padding: 0 !important;
+            margin: 0 !important;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            font-size: 0.875rem;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+
+        /* Customize Prism token colors to match dark theme */
+        .token.comment,
+        .token.prolog {
+            color: #6b7280 !important; /* gray-500 */
+        }
+
+        .token.keyword,
+        .token.builtin {
+            color: #60a5fa !important; /* blue-400 */
+            font-weight: 600;
+        }
+
+        .token.string,
+        .token.url {
+            color: #34d399 !important; /* green-400 */
+        }
+
+        .token.variable,
+        .token.constant {
+            color: #fbbf24 !important; /* yellow-400 */
+        }
+
+        .token.number {
+            color: #f87171 !important; /* red-400 */
+        }
+
+        .token.boolean {
+            color: #c084fc !important; /* purple-400 */
+        }
+
+        .token.operator,
+        .token.entity {
+            color: #9ca3af !important; /* gray-400 */
+        }
+
+        /* Ensure placeholder is visible when textarea is empty */
+        #dockerfile-editor::-webkit-input-placeholder {
+            color: #6b7280;
+        }
+        #dockerfile-editor:-moz-placeholder {
+            color: #6b7280;
+        }
+        #dockerfile-editor::-moz-placeholder {
+            color: #6b7280;
+        }
+        #dockerfile-editor:-ms-input-placeholder {
+            color: #6b7280;
+        }
+
         /* Custom styles for Mermaid nodes */
         .mermaid .node rect, .mermaid .node circle, .mermaid .node polygon {
             transition: all 0.3s ease;
@@ -1466,7 +1566,34 @@ ENTRYPOINT ["java", \\
                     </div>
                 </div>
                 <div class="flex-grow p-0">
-                    <textarea id="dockerfile-editor" class="w-full h-full p-3 bg-gray-900 text-gray-300 font-mono text-sm resize-none outline-none" placeholder="Paste your Dockerfile here..."><!-- 
+                    <!-- Syntax highlighting overlay container -->
+                    <div class="relative w-full h-full">
+                        <!-- Syntax-highlighted code display (background layer) -->
+                        <pre id="dockerfile-highlight" class="absolute top-0 left-0 w-full h-full p-3 m-0 overflow-auto font-mono text-sm pointer-events-none" style="background-color: #1f2937;"><code id="dockerfile-code" class="language-docker"><!--
+A multi-stage build example for a Node.js app.
+The 'builder' stage builds the app, and the final
+stage copies *only* the built files from 'builder'.
+-->
+FROM node:18-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+RUN npm run build
+
+FROM nginx:1.25-alpine
+WORKDIR /usr/share/nginx/html
+# This line creates the dependency link!
+COPY --from=builder /app/dist .
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+
+# Add another independent image for demo
+FROM alpine:latest AS helper
+RUN echo "This is a helper stage" > /hello.txt
+</code></pre>
+                        <!-- Transparent textarea (foreground layer for input) -->
+                        <textarea id="dockerfile-editor" class="absolute top-0 left-0 w-full h-full p-3 font-mono text-sm resize-none outline-none" style="background-color: transparent; color: transparent; caret-color: #9ca3af; z-index: 1;" placeholder="Paste your Dockerfile here..." spellcheck="false"><!--
 A multi-stage build example for a Node.js app.
 The 'builder' stage builds the app, and the final
 stage copies *only* the built files from 'builder'.
@@ -1489,6 +1616,7 @@ CMD ["nginx", "-g", "daemon off;"]
 FROM alpine:latest AS helper
 RUN echo "This is a helper stage" > /hello.txt
 </textarea>
+                    </div>
                 </div>
                 <!-- Highlight Overlay -->
                 <div id="editor-highlight-overlay" class="hidden flex-shrink-0 bg-blue-600 text-white px-3 py-2 flex items-center justify-between text-sm">
